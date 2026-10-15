@@ -119,12 +119,20 @@ def from_epoch_millis(ms: Optional[int]) -> Optional[datetime]:
     return datetime.fromtimestamp(sec, tz=timezone.utc)
 
 
+def ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """Ensure a datetime is timezone-aware UTC."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def truncate_seconds(dt: Optional[datetime]) -> Optional[datetime]:
     """R1: Before any calculation, instants are truncated to whole seconds."""
     if dt is None:
         return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+    dt = ensure_utc(dt)
     return dt.replace(microsecond=0)
 
 
@@ -136,7 +144,7 @@ def get_attendance_date(punch_in_dt: datetime, shift_start: str, shift_end: str)
     Exception - overnight shifts (shift_end <= shift_start, e.g. 22:00-06:00):
     a punch-in whose IST time is strictly earlier than shift_end belongs to the shift that started the previous day.
     """
-    punch_in_ist = punch_in_dt.astimezone(IST)
+    punch_in_ist = ensure_utc(punch_in_dt).astimezone(IST)
     is_overnight = shift_end <= shift_start
     if is_overnight:
         end_h, end_m = map(int, shift_end.split(":"))
@@ -154,7 +162,7 @@ def compute_late_minutes(punch_in_dt: datetime, shift_start: str, att_date_str: 
     h, m = map(int, shift_start.split(":"))
     att_date = date.fromisoformat(att_date_str)
     shift_start_dt = datetime.combine(att_date, time(h, m), tzinfo=IST)
-    diff_sec = (punch_in_dt - shift_start_dt).total_seconds()
+    diff_sec = (ensure_utc(punch_in_dt) - shift_start_dt).total_seconds()
     if diff_sec > 600:
         return int(diff_sec // 60)
     return 0
@@ -172,7 +180,7 @@ def compute_overtime(punch_out_dt: datetime, shift_start: str, shift_end: str, a
     if shift_end <= shift_start:
         att_date = att_date + timedelta(days=1)
     shift_end_dt = datetime.combine(att_date, time(h, m), tzinfo=IST)
-    diff_sec = (punch_out_dt - shift_end_dt).total_seconds()
+    diff_sec = (ensure_utc(punch_out_dt) - shift_end_dt).total_seconds()
     minutes = int(diff_sec // 60)
     return minutes if minutes >= 30 else 0
 
@@ -182,7 +190,7 @@ def compute_work_hours(punch_in_dt: datetime, punch_out_dt: datetime) -> float:
     R4 Work hours:
     (punch_out - punch_in) in seconds / 3600, rounded to 2 decimals half-up.
     """
-    diff_sec = (punch_out_dt - punch_in_dt).total_seconds()
+    diff_sec = (ensure_utc(punch_out_dt) - ensure_utc(punch_in_dt)).total_seconds()
     hours = Decimal(str(diff_sec)) / Decimal("3600")
     return float(hours.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
@@ -402,18 +410,19 @@ def punch_out(body: PunchOutRequest):
     else:
         punch_out_dt = truncate_seconds(datetime.now(timezone.utc))
 
-    # Find candidate record whose punch_in <= punched_at, sorted by punch_in desc
+    # Find employee's most recent record with a punch-in
     candidate = db.attendance_logs.find_one(
-        {"emp_code": body.emp_code, "punch_in": {"$lte": punch_out_dt}},
+        {"emp_code": body.emp_code, "punch_in": {"$ne": None}},
         sort=[("punch_in", DESCENDING)],
     )
 
     if not candidate:
-        raise HTTPException(status_code=404, detail="No matching punch-in found")
+        raise HTTPException(status_code=404, detail="No punch-in found")
 
-    punch_in_dt = candidate["punch_in"]
+    punch_in_dt = ensure_utc(candidate["punch_in"])
+    punch_out_dt = ensure_utc(punch_out_dt)
     if punch_out_dt <= punch_in_dt:
-        raise HTTPException(status_code=422, detail="punch_out must be strictly after punch_in")
+        raise HTTPException(status_code=422, detail="punched_at must be strictly after punch_in")
     if (punch_out_dt - punch_in_dt).total_seconds() > 24 * 3600:
         raise HTTPException(status_code=422, detail="punch_out cannot be more than 24 hours after punch_in")
 
@@ -513,8 +522,8 @@ def regularize_attendance(
 
     # Current stored fields
     cur_status = record.get("status")
-    cur_punch_in = record.get("punch_in")
-    cur_punch_out = record.get("punch_out")
+    cur_punch_in = ensure_utc(record.get("punch_in"))
+    cur_punch_out = ensure_utc(record.get("punch_out"))
     cur_work_hours = record.get("work_hours")
     cur_late_minutes = record.get("late_minutes", 0)
     cur_overtime_minutes = record.get("overtime_minutes", 0)
